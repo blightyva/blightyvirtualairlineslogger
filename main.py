@@ -1,27 +1,28 @@
 """
 Blighty VA Logger
-Tracks BLY* flights on VATSIM and stores them for VA Partner audits.
+Tracks BLY*, BLL* and BLV* flights on VATSIM
 """
 
 import asyncio
 import os
 import sqlite3
+import csv
+import io
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, Query, Form, UploadFile, File
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 import aiosqlite
+from jinja2 import Template
 
 # ------------------- CONFIG -------------------
-AIRLINE_PREFIX = os.getenv("AIRLINE_PREFIX", "BLY").upper()
+AIRLINE_PREFIXES = ["BLY", "BLL", "BLV"]
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "45"))
 DATABASE = "flights.db"
 VATSIM_URL = "https://data.vatsim.net/v3/vatsim-data.json"
+DELETE_PASSWORD = "BLIGHTYVIRTUALAIRLINES"
 
 # ------------------- DATABASE -------------------
 def init_db():
@@ -50,7 +51,7 @@ def init_db():
 
 
 # ------------------- POLLER -------------------
-online_cache: dict[int, dict] = {}  # cid -> flight data
+online_cache: dict[int, dict] = {}
 
 
 async def fetch_vatsim() -> list[dict]:
@@ -61,15 +62,21 @@ async def fetch_vatsim() -> list[dict]:
         return data.get("pilots", [])
 
 
-def parse_aircraft(fp: Optional[dict]) -> str:
+def parse_aircraft(fp: dict | None) -> str:
     if not fp:
         return ""
-    # Prefer aircraft_short, otherwise take first part before /
     short = fp.get("aircraft_short") or ""
     if short:
         return short.upper()
     full = fp.get("aircraft") or ""
     return full.split("/")[0].upper() if full else ""
+
+
+def get_airline_icao(callsign: str) -> str:
+    for prefix in AIRLINE_PREFIXES:
+        if callsign.startswith(prefix):
+            return prefix
+    return ""
 
 
 async def process_pilots(pilots: list[dict]):
@@ -79,7 +86,7 @@ async def process_pilots(pilots: list[dict]):
 
     for p in pilots:
         callsign = (p.get("callsign") or "").upper()
-        if not callsign.startswith(AIRLINE_PREFIX):
+        if not any(callsign.startswith(prefix) for prefix in AIRLINE_PREFIXES):
             continue
 
         cid = p.get("cid")
@@ -88,8 +95,8 @@ async def process_pilots(pilots: list[dict]):
 
         current_cids.add(cid)
         fp = p.get("flight_plan") or {}
+        airline = get_airline_icao(callsign)
 
-        # New connection
         if cid not in online_cache:
             logon = p.get("logon_time") or now.isoformat()
             aircraft = parse_aircraft(fp)
@@ -102,6 +109,7 @@ async def process_pilots(pilots: list[dict]):
                 "aircraft": aircraft,
                 "departure": dep,
                 "arrival": arr,
+                "airline": airline,
             }
 
             async with aiosqlite.connect(DATABASE) as db:
@@ -111,13 +119,11 @@ async def process_pilots(pilots: list[dict]):
                     (cid, callsign, airline_icao, aircraft_icao, departure, arrival, logon_time, status)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'online')
                     """,
-                    (cid, callsign, AIRLINE_PREFIX, aircraft, dep, arr, logon),
+                    (cid, callsign, airline, aircraft, dep, arr, logon),
                 )
                 await db.commit()
             print(f"[+] ONLINE  {callsign} (CID {cid})  {dep} → {arr}")
-
         else:
-            # Update aircraft / airports if they appeared later
             cache = online_cache[cid]
             aircraft = parse_aircraft(fp)
             dep = (fp.get("departure") or "").upper()
@@ -129,7 +135,6 @@ async def process_pilots(pilots: list[dict]):
             if arr and not cache.get("arrival"):
                 cache["arrival"] = arr
 
-    # Detect disconnects
     for cid in list(online_cache.keys()):
         if cid not in current_cids:
             data = online_cache.pop(cid)
@@ -157,7 +162,7 @@ async def process_pilots(pilots: list[dict]):
 
 
 async def poller_loop():
-    print(f"Blighty VA Logger started — watching prefix {AIRLINE_PREFIX}*")
+    print(f"Blighty VA Logger started — watching prefixes {', '.join(AIRLINE_PREFIXES)}*")
     while True:
         try:
             pilots = await fetch_vatsim()
@@ -177,59 +182,307 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Blighty VA Logger", lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
 
 
-# ------------------- API / PAGES -------------------
+# ------------------- HTML PAGE -------------------
+HTML_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Blighty VA Logger</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+    .card { background: #0f172a; border: 1px solid #1e293b; }
+    .accent { color: #38bdf8; }
+    .badge-online { background: #065f46; color: #6ee7b7; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-10">
+    <div class="max-w-7xl mx-auto px-4 py-4 flex flex-wrap items-center justify-between gap-4">
+      <div>
+        <h1 class="text-2xl font-bold tracking-tight">
+          <span class="accent">Blighty</span> VA Logger
+        </h1>
+        <p class="text-slate-400 text-sm mt-0.5">Watching <span class="mono accent font-medium">BLY* · BLL* · BLV*</span></p>
+      </div>
+      <div class="flex items-center gap-3 flex-wrap">
+        <a href="/export.csv?days=90"
+           class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-sm font-medium transition">
+          Export 90-day CSV
+        </a>
+        <label class="px-4 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-sm font-medium transition cursor-pointer">
+          Import CSV
+          <input type="file" accept=".csv" onchange="uploadCSV(this)" class="hidden" />
+        </label>
+        <button onclick="location.reload()"
+                class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm font-medium transition">
+          Refresh
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 py-8 space-y-8">
+    <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
+      <div class="card rounded-xl p-5">
+        <p class="text-slate-400 text-sm">Currently Online</p>
+        <p class="text-3xl font-bold mt-1 mono accent">{{ online_count }}</p>
+      </div>
+      <div class="card rounded-xl p-5">
+        <p class="text-slate-400 text-sm">Completed Flights (90d)</p>
+        <p class="text-3xl font-bold mt-1 mono">{{ total_flights }}</p>
+      </div>
+      <div class="card rounded-xl p-5">
+        <p class="text-slate-400 text-sm">Unique Pilots (90d)</p>
+        <p class="text-3xl font-bold mt-1 mono {% if unique_pilots >= 15 %}text-emerald-400{% else %}text-amber-400{% endif %}">
+          {{ unique_pilots }} <span class="text-sm font-normal text-slate-400">/ 15</span>
+        </p>
+      </div>
+      <div class="card rounded-xl p-5">
+        <p class="text-slate-400 text-sm">Total Flight Hours (90d)</p>
+        <p class="text-3xl font-bold mt-1 mono text-sky-300">{{ total_hours }}</p>
+      </div>
+    </div>
+
+    <section>
+      <h2 class="text-lg font-semibold mb-3 flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        Live Flights
+      </h2>
+      {% if online %}
+      <div class="card rounded-xl overflow-hidden">
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead class="bg-slate-800/60 text-slate-400 text-left">
+              <tr>
+                <th class="px-4 py-3 font-medium">Callsign</th>
+                <th class="px-4 py-3 font-medium">CID</th>
+                <th class="px-4 py-3 font-medium">Route</th>
+                <th class="px-4 py-3 font-medium">Aircraft</th>
+                <th class="px-4 py-3 font-medium">Logon (Z)</th>
+                <th class="px-4 py-3 font-medium">Status</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-800">
+              {% for f in online %}
+              <tr class="hover:bg-slate-800/40">
+                <td class="px-4 py-3 mono font-medium accent">{{ f.callsign }}</td>
+                <td class="px-4 py-3 mono">{{ f.cid }}</td>
+                <td class="px-4 py-3 mono">{{ f.departure or "----" }} <span class="text-slate-500">→</span> {{ f.arrival or "----" }}</td>
+                <td class="px-4 py-3 mono">{{ f.aircraft_icao or "—" }}</td>
+                <td class="px-4 py-3 mono text-slate-300">{{ f.logon_time[:19] if f.logon_time else "—" }}Z</td>
+                <td class="px-4 py-3"><span class="badge-online text-xs px-2 py-0.5 rounded-full font-medium">ONLINE</span></td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% else %}
+      <div class="card rounded-xl p-8 text-center text-slate-500">
+        No BLY / BLL / BLV flights currently online on VATSIM
+      </div>
+      {% endif %}
+    </section>
+
+    <section>
+      <h2 class="text-lg font-semibold mb-3">Recent Completed Flights</h2>
+      {% if completed %}
+      <div class="card rounded-xl overflow-hidden">
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead class="bg-slate-800/60 text-slate-400 text-left">
+              <tr>
+                <th class="px-4 py-3 font-medium">Callsign</th>
+                <th class="px-4 py-3 font-medium">CID</th>
+                <th class="px-4 py-3 font-medium">Route</th>
+                <th class="px-4 py-3 font-medium">Aircraft</th>
+                <th class="px-4 py-3 font-medium">Logon (Z)</th>
+                <th class="px-4 py-3 font-medium">Logoff (Z)</th>
+                <th class="px-4 py-3 font-medium">Duration</th>
+                <th class="px-4 py-3 font-medium">Action</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-800">
+              {% for f in completed %}
+              <tr class="hover:bg-slate-800/40">
+                <td class="px-4 py-3 mono font-medium">{{ f.callsign }}</td>
+                <td class="px-4 py-3 mono">{{ f.cid }}</td>
+                <td class="px-4 py-3 mono">{{ f.departure or "----" }} <span class="text-slate-500">→</span> {{ f.arrival or "----" }}</td>
+                <td class="px-4 py-3 mono">{{ f.aircraft_icao or "—" }}</td>
+                <td class="px-4 py-3 mono text-slate-300">{{ f.logon_time[:19] if f.logon_time else "—" }}Z</td>
+                <td class="px-4 py-3 mono text-slate-300">{{ f.logoff_time[:19] if f.logoff_time else "—" }}Z</td>
+                <td class="px-4 py-3 mono">
+                  {% if f.total_minutes %}{{ (f.total_minutes // 60) }}h {{ (f.total_minutes % 60) }}m{% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-3">
+                  <form method="POST" action="/delete/{{ f.id }}" onsubmit="return confirm('Delete this flight?');" class="inline">
+                    <input type="hidden" name="password" id="pw-{{ f.id }}">
+                    <button type="button" onclick="askPassword({{ f.id }})"
+                            class="text-xs px-2 py-1 rounded bg-red-900/60 hover:bg-red-700 text-red-200 transition">
+                      Delete
+                    </button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% else %}
+      <div class="card rounded-xl p-8 text-center text-slate-500">
+        No completed flights yet. The logger is watching…
+      </div>
+      {% endif %}
+    </section>
+
+    <footer class="text-center text-slate-600 text-xs pt-4 pb-8">
+      Blighty VA Logger • Tracking BLY · BLL · BLV • Data from VATSIM public feed<br>
+      Auto-refreshes every 60 seconds • For VATSIM Partner audits use the Export button
+    </footer>
+  </main>
+
+  <script>
+    setTimeout(() => location.reload(), 60000);
+
+    function askPassword(id) {
+      const pw = prompt("Enter delete password:");
+      if (pw === null) return;
+      document.getElementById("pw-" + id).value = pw;
+      document.querySelector(`form[action="/delete/${id}"]`).submit();
+    }
+
+    async function uploadCSV(input) {
+      if (!input.files.length) return;
+      const formData = new FormData();
+      formData.append("file", input.files[0]);
+      const res = await fetch("/import", { method: "POST", body: formData });
+      if (res.ok) {
+        alert("CSV imported successfully!");
+        location.reload();
+      } else {
+        const text = await res.text();
+        alert("Import failed: " + text);
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     async with aiosqlite.connect(DATABASE) as db:
         db.row_factory = aiosqlite.Row
 
-        # Currently online
         online = await db.execute_fetchall(
             "SELECT * FROM flights WHERE status = 'online' ORDER BY logon_time DESC"
         )
-
-        # Recent completed (last 50)
         completed = await db.execute_fetchall(
-            "SELECT * FROM flights WHERE status = 'completed' ORDER BY logoff_time DESC LIMIT 50"
+            "SELECT * FROM flights WHERE status = 'completed' ORDER BY logoff_time DESC LIMIT 80"
         )
 
-        # Stats for last 90 days
         cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
         stats = await db.execute_fetchall(
             """
-            SELECT
-                COUNT(*) as total_flights,
-                COUNT(DISTINCT cid) as unique_pilots
-            FROM flights
+            SELECT 
+                COUNT(*) as total_flights, 
+                COUNT(DISTINCT cid) as unique_pilots,
+                COALESCE(SUM(total_minutes), 0) as total_minutes
+            FROM flights 
             WHERE logon_time >= ? AND status = 'completed'
             """,
             (cutoff,),
         )
         total_flights = stats[0]["total_flights"] if stats else 0
         unique_pilots = stats[0]["unique_pilots"] if stats else 0
+        total_minutes = stats[0]["total_minutes"] if stats else 0
+        total_hours = round(total_minutes / 60, 1)
 
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "online": online,
-            "completed": completed,
-            "total_flights": total_flights,
-            "unique_pilots": unique_pilots,
-            "prefix": AIRLINE_PREFIX,
-            "logger_name": "Blighty VA Logger",
-        },
+    template = Template(HTML_PAGE)
+    html = template.render(
+        online=online,
+        completed=completed,
+        online_count=len(online),
+        total_flights=total_flights,
+        unique_pilots=unique_pilots,
+        total_hours=total_hours,
     )
+    return HTMLResponse(html)
+
+
+@app.post("/delete/{flight_id}")
+async def delete_flight(flight_id: int, password: str = Form(...)):
+    if password != DELETE_PASSWORD:
+        return HTMLResponse("<h1>Wrong password</h1><a href='/'>Go back</a>", status_code=403)
+
+    async with aiosqlite.connect(DATABASE) as db:
+        await db.execute("DELETE FROM flights WHERE id = ?", (flight_id,))
+        await db.commit()
+
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/import")
+async def import_csv(file: UploadFile = File(...)):
+    content = await file.read()
+    text = content.decode("utf-8")
+    reader = csv.DictReader(io.StringIO(text))
+
+    imported = 0
+    async with aiosqlite.connect(DATABASE) as db:
+        for row in reader:
+            callsign = (row.get("Callsign") or row.get("callsign") or "").strip().upper()
+            if not callsign:
+                continue
+
+            cid = row.get("CID") or row.get("cid") or 0
+            try:
+                cid = int(cid)
+            except:
+                cid = 0
+
+            departure = (row.get("Departure") or row.get("departure") or "").strip().upper()
+            arrival = (row.get("Arrival") or row.get("arrival") or "").strip().upper()
+            logon = (row.get("Logon (Z)") or row.get("logon_time") or row.get("Logon") or "").strip()
+            logoff = (row.get("Logoff (Z)") or row.get("logoff_time") or row.get("Logoff") or "").strip()
+            aircraft = (row.get("Aircraft") or row.get("aircraft_icao") or "").strip().upper()
+            duration = row.get("Duration (min)") or row.get("total_minutes") or 0
+            try:
+                duration = int(float(duration))
+            except:
+                duration = 0
+
+            airline = get_airline_icao(callsign)
+
+            # Only import if it looks like one of our prefixes
+            if not airline:
+                continue
+
+            await db.execute(
+                """
+                INSERT INTO flights
+                (cid, callsign, airline_icao, aircraft_icao, departure, arrival, logon_time, logoff_time, total_minutes, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')
+                """,
+                (cid, callsign, airline, aircraft, departure, arrival, logon, logoff or None, duration),
+            )
+            imported += 1
+        await db.commit()
+
+    return HTMLResponse(f"Imported {imported} flights")
 
 
 @app.get("/export.csv")
-async def export_csv(
-    days: int = Query(90, ge=1, le=365),
-):
-    """CSV export suitable for VATSIM VA Partner audits"""
+async def export_csv(days: int = Query(90, ge=1, le=365)):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
     async with aiosqlite.connect(DATABASE) as db:
@@ -258,16 +511,6 @@ async def export_csv(
     )
 
 
-@app.get("/api/online")
-async def api_online():
-    async with aiosqlite.connect(DATABASE) as db:
-        db.row_factory = aiosqlite.Row
-        rows = await db.execute_fetchall(
-            "SELECT * FROM flights WHERE status = 'online' ORDER BY logon_time DESC"
-        )
-        return [dict(r) for r in rows]
-
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "prefix": AIRLINE_PREFIX, "online_tracked": len(online_cache)}
+    return {"status": "ok", "prefixes": AIRLINE_PREFIXES, "online_tracked": len(online_cache)}
